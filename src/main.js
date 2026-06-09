@@ -818,6 +818,27 @@ function playSound(name) {
   sendToRenderer("play-sound", { url, volume: soundVolume });
 }
 
+function formatCompletionBubbleMessage(payload = {}) {
+  const lines = [t("codexCompletionMsg")];
+  const title = typeof payload.sessionTitle === "string" ? payload.sessionTitle.trim() : "";
+  const cwd = typeof payload.cwd === "string" ? payload.cwd.trim() : "";
+  const host = typeof payload.host === "string" ? payload.host.trim() : "";
+  if (title) lines.push(title);
+  else if (cwd) lines.push(cwd);
+  if (host) lines.push(host);
+  return lines.join("\n");
+}
+
+function showCompletionBubble(payload = {}) {
+  return showUpdateBubble({
+    mode: "complete",
+    lang,
+    title: t("codexCompletionTitle"),
+    message: formatCompletionBubbleMessage(payload),
+    defaultAction: "dismiss",
+  });
+}
+
 function resetSoundCooldown() {
   lastSoundTime = 0;
 }
@@ -1139,6 +1160,7 @@ const _stateCtx = {
   syncHitWin,
   playSound,
   flashTaskbar,
+  showCompletionBubble,
   t: (key) => t(key),
   focusTerminalWindow: (...args) => focusTerminalWindow(...args),
   resolvePermissionEntry: (...args) => resolvePermissionEntry(...args),

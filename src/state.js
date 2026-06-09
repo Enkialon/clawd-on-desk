@@ -234,6 +234,22 @@ function shouldSuppressDuplicateCompletionVisual(existing, state, event) {
   return existing.awaitingInputSinceStop === true || hasCompletionTailWithoutProgress(existing);
 }
 
+function maybeShowCodexCompletionBubble(sessionId, session, event) {
+  if (!session || session.agentId !== "codex") return;
+  if (session.headless) return;
+  if (!POST_COMPLETION_EVENTS.has(event)) return;
+  if (typeof ctx.showCompletionBubble !== "function") return;
+  try {
+    ctx.showCompletionBubble({
+      agentId: "codex",
+      sessionId,
+      cwd: session.cwd || "",
+      host: session.host || null,
+      sessionTitle: session.sessionTitle || null,
+    });
+  } catch {}
+}
+
 function shouldMuteMiniPostCompletionNotification(state, event, session) {
   return !!ctx.miniMode
     && state === "notification"
@@ -1484,6 +1500,7 @@ function updateSession(sessionId, state, event, opts = {}) {
       setState(displayState, getSvgOverride(displayState));
       return;
     }
+    maybeShowCodexCompletionBubble(sessionId, sessions.get(sessionId), event);
     setState(state);
     return;
   }

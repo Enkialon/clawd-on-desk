@@ -1502,6 +1502,70 @@ describe("updateSession()", () => {
     assert.strictEqual(api.sessions.get("codex:remote").requiresCompletionAck, true);
   });
 
+  it("shows one local Codex completion bubble and suppresses duplicate completion events", () => {
+    const bubbles = [];
+    api.cleanup();
+    ctx = makeCtx({
+      processKill: () => true,
+      showCompletionBubble: (payload) => bubbles.push(payload),
+    });
+    api = require("../src/state")(ctx);
+
+    update(api, {
+      id: "codex:s1",
+      state: "working",
+      event: "PreToolUse",
+      agentId: "codex",
+      cwd: "/repo",
+      sessionTitle: "Fix flaky test",
+    });
+    update(api, {
+      id: "codex:s1",
+      state: "attention",
+      event: "Stop",
+      agentId: "codex",
+      cwd: "/repo",
+      sessionTitle: "Fix flaky test",
+    });
+    update(api, {
+      id: "codex:s1",
+      state: "attention",
+      event: "event_msg:task_complete",
+      agentId: "codex",
+      cwd: "/repo",
+      sessionTitle: "Fix flaky test",
+    });
+
+    assert.strictEqual(bubbles.length, 1);
+    assert.deepStrictEqual(bubbles[0], {
+      agentId: "codex",
+      sessionId: "codex:s1",
+      cwd: "/repo",
+      host: null,
+      sessionTitle: "Fix flaky test",
+    });
+  });
+
+  it("does not show completion bubbles for headless Codex subagent sessions", () => {
+    const bubbles = [];
+    api.cleanup();
+    ctx = makeCtx({
+      processKill: () => true,
+      showCompletionBubble: (payload) => bubbles.push(payload),
+    });
+    api = require("../src/state")(ctx);
+
+    update(api, {
+      id: "codex:sub",
+      state: "attention",
+      event: "event_msg:task_complete",
+      agentId: "codex",
+      headless: true,
+    });
+
+    assert.deepStrictEqual(bubbles, []);
+  });
+
   it("still plays completion after new progress follows a completed turn", () => {
     const soundsPlayed = [];
     const stateChanges = [];
