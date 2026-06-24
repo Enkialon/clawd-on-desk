@@ -100,6 +100,11 @@ const COMPLETION_CANCEL_EVENTS = new Set([
 // UserPromptSubmit lands within hook-spawn latency (~0.3s) of the Stop, so a
 // 2s quiet window absorbs it; a genuinely final Stop just celebrates 2s late.
 const HEADLESS_COMPLETION_DEBOUNCE_MS = 2000;
+// Claude Desktop can leave a background_tasks entry attached to a user-visible
+// final Stop even after the assistant reply is complete. Treat that bg-only
+// Stop as tentative, not permanently working, when the hook also extracted the
+// assistant's final text.
+const BACKGROUND_TASKS_COMPLETION_DEBOUNCE_MS = 2000;
 function getCompletionDebounceMs(headless) {
   const raw = process.env.CLAWD_COMPLETION_DEBOUNCE_MS;
   const n = Number.parseInt(raw, 10);
@@ -111,6 +116,12 @@ function getCompletionDebounceMs(headless) {
   // user otherwise wants the celebration the instant the turn ends. Headless
   // sessions default to the #449 window above.
   return headless ? HEADLESS_COMPLETION_DEBOUNCE_MS : 0;
+}
+function getBackgroundTasksCompletionDebounceMs(headless) {
+  const raw = process.env.CLAWD_COMPLETION_DEBOUNCE_MS;
+  const n = Number.parseInt(raw, 10);
+  if (Number.isFinite(n) && n >= 0 && n <= 10000) return n;
+  return Math.max(getCompletionDebounceMs(headless), BACKGROUND_TASKS_COMPLETION_DEBOUNCE_MS);
 }
 let lastSessionSnapshotSignature = null;
 let lastSessionSnapshot = null;
@@ -170,8 +181,19 @@ const UPDATE_VISUAL_PRIORITY_MAP = {
 };
 
 // ── Wake poll ──
+const WAKE_POLL_START_DELAY_MS = 500;
+// Cursor-sample cadence while dozing/collapsing/sleeping. (A low-power idle-mode
+// slowdown was tried here and removed: real-machine powermetrics showed no wakeup
+// or CPU win — macOS timer coalescing absorbs a 200ms timer — for added latency.)
+const WAKE_POLL_MS = 200;
+let wakePollStartTimer = null;
+let wakePollStartState = null;
 let wakePollTimer = null;
 let lastWakeCursorX = null, lastWakeCursorY = null;
+
+function isWakePollState(state) {
+  return state === "dozing" || state === "collapsing" || state === "sleeping";
+}
 
 // ── Kimi CLI permission hold ──
 // Keeps the pet in notification state while Kimi is waiting for user approval.
@@ -327,6 +349,8 @@ function refreshTheme() {
   SVG_IDLE_FOLLOW = theme.states.idle[0];
   STATE_SVGS = { ...theme.states };
   STATE_BINDINGS = buildStateBindings(theme);
+  // Sync back so settings-animation-overrides can resolve roam/fallback states
+  theme._stateBindings = STATE_BINDINGS;
   if (theme.miniMode && theme.miniMode.states) {
     Object.assign(STATE_SVGS, theme.miniMode.states);
   }
@@ -595,10 +619,8 @@ function applyState(state, svgOverride, options = {}) {
     ctx.sendToRenderer("eye-move", 0, 0);
   }
 
-  if ((state === "dozing" || state === "collapsing" || state === "sleeping") && !ctx.doNotDisturb) {
-    setTimeout(() => {
-      if (currentState === state) startWakePoll();
-    }, 500);
+  if (isWakePollState(state) && !ctx.doNotDisturb) {
+    scheduleWakePollStart(state);
   } else {
     stopWakePoll();
   }
@@ -636,31 +658,64 @@ function applyState(state, svgOverride, options = {}) {
 }
 
 // ── Wake poll ──
+function clearWakePollStartTimer() {
+  if (!wakePollStartTimer) return;
+  clearTimeout(wakePollStartTimer);
+  wakePollStartTimer = null;
+  wakePollStartState = null;
+}
+
+function scheduleWakePollStart(state) {
+  if (wakePollTimer) return;
+  if (wakePollStartTimer && wakePollStartState === state) return;
+  clearWakePollStartTimer();
+  wakePollStartState = state;
+  wakePollStartTimer = setTimeout(() => {
+    wakePollStartTimer = null;
+    wakePollStartState = null;
+    if (currentState === state) startWakePoll();
+  }, WAKE_POLL_START_DELAY_MS);
+}
+
 function startWakePoll() {
   if (!_getCursor || wakePollTimer) return;
+  if (!isWakePollState(currentState) || ctx.doNotDisturb) return;
   const cursor = _getCursor();
   lastWakeCursorX = cursor.x;
   lastWakeCursorY = cursor.y;
+  scheduleWakePollTick();
+}
 
-  wakePollTimer = setInterval(() => {
-    const cursor = _getCursor();
-    const moved = cursor.x !== lastWakeCursorX || cursor.y !== lastWakeCursorY;
+function scheduleWakePollTick(delay = WAKE_POLL_MS) {
+  if (!_getCursor || wakePollTimer) return;
+  clearWakePollStartTimer();
+  wakePollTimer = setTimeout(runWakePollTick, delay);
+}
 
-    if (moved) {
-      stopWakePoll();
-      wakeFromDoze();
-      return;
-    }
+function runWakePollTick() {
+  wakePollTimer = null;
+  if (!_getCursor || !isWakePollState(currentState) || ctx.doNotDisturb) return;
+  const cursor = _getCursor();
+  const moved = cursor.x !== lastWakeCursorX || cursor.y !== lastWakeCursorY;
 
-    if (currentState === "dozing" && Date.now() - ctx.mouseStillSince >= DEEP_SLEEP_TIMEOUT) {
-      stopWakePoll();
-      applyState("collapsing");
-    }
-  }, 200);
+  if (moved) {
+    stopWakePoll();
+    wakeFromDoze();
+    return;
+  }
+
+  if (currentState === "dozing" && Date.now() - ctx.mouseStillSince >= DEEP_SLEEP_TIMEOUT) {
+    applyState("collapsing");
+    scheduleWakePollTick();
+    return;
+  }
+
+  scheduleWakePollTick();
 }
 
 function stopWakePoll() {
-  if (wakePollTimer) { clearInterval(wakePollTimer); wakePollTimer = null; }
+  clearWakePollStartTimer();
+  if (wakePollTimer) { clearTimeout(wakePollTimer); wakePollTimer = null; }
 }
 
 function wakeFromDoze() {
@@ -1012,12 +1067,12 @@ function updateSessionFocusMetadata(sessionId, opts = {}) {
 
 // ── #406 Stop completion gate ──
 // A Claude "Stop" maps to "attention" (celebrate + complete sound), but a Stop
-// is not always a real turn completion. Decidable-now signals (live
-// background_tasks/session_crons, or a stop_hook_active continuation) are held
-// as "working" by updateSession directly. For a plain Stop we debounce: hold
-// "working" and only celebrate if no forward-progress event for the session
-// arrives within the window — this catches a third-party Stop hook that vetoes
-// the stop (Claude keeps going) without us ever seeing the veto.
+// is not always a real turn completion. Decidable-now signals (live crons,
+// background tasks with no final assistant text, or a stop_hook_active
+// continuation) are held as "working" by updateSession directly. Plain Stops
+// and bg-only Stops with final assistant text can be debounced: hold "working"
+// and only celebrate if no forward-progress event for the session arrives
+// within the window.
 function scheduleCompletionDebounce(sessionId, debounceMs) {
   const existing = pendingCompletionTimers.get(sessionId);
   if (existing) clearTimeout(existing);
@@ -1082,6 +1137,8 @@ function updateSession(sessionId, state, event, opts = {}) {
     cwd = null,
     editor = null,
     pidChain = null,
+    tmuxSocket = null,
+    tmuxClient = null,
     agentPid = null,
     agentId = null,
     host = null,
@@ -1136,7 +1193,8 @@ function updateSession(sessionId, state, event, opts = {}) {
     ) return;
     const shouldPersistCodexPermissionFocus = permAgentId === "codex" && (
       sourcePid || wtHwnd || agentPid || (pidChain && pidChain.length) || cwd || host ||
-      model || provider || codexOriginator || codexSource || platform || ghosttyTerminalId
+      model || provider || codexOriginator || codexSource || platform || ghosttyTerminalId ||
+      tmuxSocket || tmuxClient
     );
     if (shouldPersistCodexPermissionFocus) {
       const existing = sessions.get(sessionId);
@@ -1146,6 +1204,8 @@ function updateSession(sessionId, state, event, opts = {}) {
       const srcCwd = cwd || (existing && existing.cwd) || "";
       const srcEditor = editor || (existing && existing.editor) || null;
       const srcPidChain = (pidChain && pidChain.length) ? pidChain : (existing && existing.pidChain) || null;
+      const srcTmuxSocket = tmuxSocket || (existing && existing.tmuxSocket) || null;
+      const srcTmuxClient = tmuxClient || (existing && existing.tmuxClient) || null;
       const srcAgentPid = agentPid || (existing && existing.agentPid) || null;
       const srcAgentId = resolveIncomingAgentId(existing, agentId, agentIdDefaulted);
       const srcHost = host || (existing && existing.host) || null;
@@ -1176,6 +1236,8 @@ function updateSession(sessionId, state, event, opts = {}) {
         cwd: srcCwd,
         editor: srcEditor,
         pidChain: srcPidChain,
+        tmuxSocket: srcTmuxSocket,
+        tmuxClient: srcTmuxClient,
         agentPid: srcAgentPid,
         agentId: srcAgentId,
         host: srcHost,
@@ -1205,6 +1267,8 @@ function updateSession(sessionId, state, event, opts = {}) {
   const srcCwd = cwd || (existing && existing.cwd) || "";
   const srcEditor = editor || (existing && existing.editor) || null;
   const srcPidChain = (pidChain && pidChain.length) ? pidChain : (existing && existing.pidChain) || null;
+  const srcTmuxSocket = tmuxSocket || (existing && existing.tmuxSocket) || null;
+  const srcTmuxClient = tmuxClient || (existing && existing.tmuxClient) || null;
   const srcAgentPid = agentPid || (existing && existing.agentPid) || null;
   const srcAgentId = resolveIncomingAgentId(existing, agentId, agentIdDefaulted);
   const srcHost = host || (existing && existing.host) || null;
@@ -1233,9 +1297,9 @@ function updateSession(sessionId, state, event, opts = {}) {
   //   · live background_tasks / session_crons → work continues in the bg
   //   · stop_hook_active → a Stop hook vetoed the stop; Claude will continue
   //   · a third-party Stop hook can veto THIS stop, invisibly to us → debounce
-  // The first two are decidable now: hold "working" (badge stays "running", no
-  // celebrate, no "done"). A plain Stop is debounced — held "working" until a
-  // quiet window with no forward-progress event confirms the turn really ended.
+  // Hard gates hold "working" (badge stays "running", no celebrate, no
+  // "done"). A plain Stop, and a bg-only Stop that already has final assistant
+  // text, can be debounced until a quiet window confirms the turn really ended.
   if (
     !duplicateCompletionVisualAtEntry
     && event === "Stop"
@@ -1243,10 +1307,16 @@ function updateSession(sessionId, state, event, opts = {}) {
     && srcAgentId === "claude-code"
   ) {
     cancelCompletionDebounce(sessionId, "stop-superseded");
-    const liveWork =
-      backgroundTasksCount > 0 || sessionCronsCount > 0 || stopHookActive === true;
-    const debounceMs = getCompletionDebounceMs(srcHeadless);
-    if (liveWork || debounceMs > 0) {
+    const hasFinalAssistantText = !!srcAssistantLastOutput;
+    const hardLiveWork =
+      sessionCronsCount > 0 ||
+      stopHookActive === true ||
+      (backgroundTasksCount > 0 && !hasFinalAssistantText);
+    const backgroundDebounceMs = backgroundTasksCount > 0 && hasFinalAssistantText
+      ? getBackgroundTasksCompletionDebounceMs(srcHeadless)
+      : 0;
+    const debounceMs = Math.max(getCompletionDebounceMs(srcHeadless), backgroundDebounceMs);
+    if (hardLiveWork || debounceMs > 0) {
       // Hold the Stop as "working" and DROP the event to null so recentEvents
       // keeps NO "Stop" tail while held. Why null and not "Stop": deriveSessionBadge
       // only inspects the latest event, so a withheld Stop tail would (a) be
@@ -1257,16 +1327,22 @@ function updateSession(sessionId, state, event, opts = {}) {
       // the quiet window confirms the turn actually ended.
       state = "working";
       event = null;
-      if (liveWork) {
+      if (hardLiveWork) {
         debugSession(
           `stop-gate sid=${sessionId} bg=${backgroundTasksCount} crons=${sessionCronsCount} active=${stopHookActive} action=hold-working`
         );
-        // liveWork never auto-promotes; a later plain Stop (no bg work) will.
+        // Hard live work never auto-promotes; a later plain Stop (no hard
+        // blockers) will.
       } else {
+        if (backgroundTasksCount > 0) {
+          debugSession(
+            `stop-gate sid=${sessionId} bg=${backgroundTasksCount} crons=${sessionCronsCount} active=${stopHookActive} action=debounce-working`
+          );
+        }
         scheduleCompletionDebounce(sessionId, debounceMs);
       }
     }
-    // debounceMs <= 0 && !liveWork → keep "attention" (immediate celebration).
+    // debounceMs <= 0 && !hardLiveWork → keep "attention" (immediate celebration).
   }
 
   // Qwen Code 0.16.1 self-submit guard. qwen's agentic loop fires a synthetic
@@ -1326,7 +1402,7 @@ function updateSession(sessionId, state, event, opts = {}) {
   const srcLastStopAt = isStopBoundary
     ? Date.now()
     : (existing && Number.isFinite(existing.lastStopAt) ? existing.lastStopAt : null);
-  const base = { sourcePid: srcPid, wtHwnd: srcWtHwnd, cwd: srcCwd, editor: srcEditor, pidChain: srcPidChain, agentPid: srcAgentPid, agentId: srcAgentId, host: srcHost, headless: srcHeadless, platform: srcPlatform, model: srcModel, provider: srcProvider, codexOriginator: srcCodexOriginator, codexSource: srcCodexSource, ghosttyTerminalId: srcGhosttyTerminalId, sessionTitle: srcSessionTitle, contextUsage: srcContextUsage, assistantLastOutput: srcAssistantLastOutput, assistantLastOutputTruncated: srcAssistantLastOutputTruncated, recentEvents, pidReachable, lastToolBoundaryAt: srcLastToolBoundaryAt, lastStopAt: srcLastStopAt, awaitingInputSinceStop: resolveAwaitingInputSinceStop(existing, event), muteNotificationSound: state === "notification" && muteNotificationSound === true };
+  const base = { sourcePid: srcPid, wtHwnd: srcWtHwnd, cwd: srcCwd, editor: srcEditor, pidChain: srcPidChain, tmuxSocket: srcTmuxSocket, tmuxClient: srcTmuxClient, agentPid: srcAgentPid, agentId: srcAgentId, host: srcHost, headless: srcHeadless, platform: srcPlatform, model: srcModel, provider: srcProvider, codexOriginator: srcCodexOriginator, codexSource: srcCodexSource, ghosttyTerminalId: srcGhosttyTerminalId, sessionTitle: srcSessionTitle, contextUsage: srcContextUsage, assistantLastOutput: srcAssistantLastOutput, assistantLastOutputTruncated: srcAssistantLastOutputTruncated, recentEvents, pidReachable, lastToolBoundaryAt: srcLastToolBoundaryAt, lastStopAt: srcLastStopAt, awaitingInputSinceStop: resolveAwaitingInputSinceStop(existing, event), muteNotificationSound: state === "notification" && muteNotificationSound === true };
   if (preserveCompletionAck) base.requiresCompletionAck = true;
 
   // Evict oldest session if at capacity and this is a new session.
@@ -1492,7 +1568,7 @@ function updateSession(sessionId, state, event, opts = {}) {
     // wait-for-input alerts toggle is off.
     if (
       event === "Notification"
-      && state === "notification"
+      && (state === "notification" || state === "attention")
       && srcAgentId
       && typeof ctx.isAgentNotificationHookEnabled === "function"
       && !ctx.isAgentNotificationHookEnabled(srcAgentId)
@@ -1732,7 +1808,7 @@ function detectRunningAgentProcesses(callback) {
   const { execFile, exec } = require("child_process");
   if (process.platform === "win32") {
     const psScript =
-      "$names = 'claude.exe','codex.exe','copilot.exe','gemini.exe','agy.exe','codebuddy.exe','kiro-cli.exe','kimi.exe','opencode.exe','pi.exe','hermes.exe','qodercli.exe','qoder-cli.exe'; " +
+      "$names = 'claude.exe','codex.exe','copilot.exe','gemini.exe','agy.exe','codebuddy.exe','kiro-cli.exe','kimi.exe','codewhale.exe','opencode.exe','pi.exe','hermes.exe','qodercli.exe','qoder-cli.exe'; " +
       "$match = Get-CimInstance Win32_Process | Where-Object { " +
         "$names -contains $_.Name -or ($_.Name -eq 'node.exe' -and $_.CommandLine -like '*claude-code*') " +
       "} | Select-Object -First 1; " +
@@ -1744,7 +1820,7 @@ function detectRunningAgentProcesses(callback) {
       (err, stdout) => done(!err && /\d+/.test(stdout))
     );
   } else {
-    exec("pgrep -f 'claude-code|codex|copilot|codebuddy|kimi|@earendil-works/pi-coding-agent|pi-coding-agent/dist/cli\\.js' || pgrep -x 'gemini' || pgrep -x 'agy' || pgrep -x 'kiro-cli' || pgrep -x 'opencode' || pgrep -x 'hermes' || pgrep -x 'qodercli' || pgrep -x 'qoder-cli'", { timeout: 3000 },
+    exec("pgrep -f 'claude-code|codex|copilot|codebuddy|kimi|@earendil-works/pi-coding-agent|pi-coding-agent/dist/cli\\.js' || pgrep -x 'gemini' || pgrep -x 'agy' || pgrep -x 'kiro-cli' || pgrep -x 'codewhale' || pgrep -x 'opencode' || pgrep -x 'hermes' || pgrep -x 'qodercli' || pgrep -x 'qoder-cli'", { timeout: 3000 },
       (err) => done(!err)
     );
   }
@@ -1995,7 +2071,7 @@ function cleanup() {
   clearAllCompletionDebounces();
   if (eyeResendTimer) clearTimeout(eyeResendTimer);
   if (startupRecoveryTimer) clearTimeout(startupRecoveryTimer);
-  if (wakePollTimer) clearInterval(wakePollTimer);
+  stopWakePoll();
   for (const { timer } of kimiPermissionHolds.values()) {
     if (timer) clearTimeout(timer);
   }

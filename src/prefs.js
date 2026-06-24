@@ -37,8 +37,20 @@ const {
   MAX_AUTO_CLOSE_SECONDS,
 } = require("./bubble-policy");
 const { normalizeSessionAliases } = require("./session-alias");
+const {
+  TEXT_SCALE_MIN,
+  TEXT_SCALE_MAX,
+  TEXT_SCALE_DEFAULT,
+  normalizeTextScaleByDisplay,
+} = require("./text-scale");
 
-const CURRENT_VERSION = 9;
+const CURRENT_VERSION = 12;
+const DEFAULT_INTEGRATION_INSTALLED_IDS = Object.freeze(["claude-code", "codex"]);
+const DEFAULT_INTEGRATION_INSTALLED_SET = new Set(DEFAULT_INTEGRATION_INSTALLED_IDS);
+
+function isDefaultIntegrationInstalled(agentId) {
+  return DEFAULT_INTEGRATION_INSTALLED_SET.has(agentId);
+}
 
 // ── Schema ──
 // Each field has: type, default OR defaultFactory, optional enum/normalize/validate.
@@ -84,7 +96,13 @@ const SCHEMA = {
   // Pure data prefs
   lang: { type: "string", default: "en", enum: ["en", "zh", "zh-TW", "ko", "ja"] },
   showTray: { type: "boolean", default: true },
-  showDock: { type: "boolean", default: true },
+  // Default off (macOS): a fresh install runs as an accessory/agent app — pet +
+  // menu-bar icon, no Dock tile. Existing users keep their Dock — a persisted
+  // showDock is kept (save() bakes the full snapshot), and the v11->v12 migration
+  // backfills showDock=true for any pre-v12 file that lacks the key — so ONLY
+  // brand-new installs (which never run migrate) pick up this off default.
+  // showTray stays default-on so there is always one access point (menu bar).
+  showDock: { type: "boolean", default: false },
   manageClaudeHooksAutomatically: { type: "boolean", default: true },
   autoStartWithClaude: { type: "boolean", default: false },
   // System-backed: actual truth lives in OS login items / autostart files.
@@ -97,9 +115,9 @@ const SCHEMA = {
   bubbleFollowPet: { type: "boolean", default: false },
   sessionHudEnabled: { type: "boolean", default: true },
   sessionHudShowStateLabels: { type: "boolean", default: true },
-  sessionHudShowElapsed: { type: "boolean", default: true },
+  sessionHudShowElapsed: { type: "boolean", default: false },
   sessionHudShowContextUsage: { type: "boolean", default: true },
-  sessionHudCleanupDetached: { type: "boolean", default: false },
+  sessionHudCleanupDetached: { type: "boolean", default: true },
   sessionHudPinned: { type: "boolean", default: false },
   // Stale-cleanup intervals (ms). Defaults match the historical constants in
   // state-stale-cleanup.js so upgrading users see no behavioral change.
@@ -182,6 +200,23 @@ const SCHEMA = {
   // proportional pixel-size recomputation. The pet keeps its current
   // window size; the size slider still works (per-display proportional).
   keepSizeAcrossDisplays: { type: "boolean", default: false },
+  // Free roam: when enabled and the pet is idle, it will wander around the screen
+  freeRoam: { type: "boolean", default: false },
+  // Text-window zoom (bubbles, HUD, dashboard, settings, resume input). The
+  // pet itself scales via `size` and is never zoomed. `textScale` is the
+  // global default; `textScaleByDisplay` overrides it per display id (the
+  // slider writes the entry for the display the settings window sits on, via
+  // the setTextScaleForDisplay command).
+  textScale: {
+    type: "number",
+    default: TEXT_SCALE_DEFAULT,
+    validate: (v) => Number.isFinite(v) && v >= TEXT_SCALE_MIN && v <= TEXT_SCALE_MAX,
+  },
+  textScaleByDisplay: {
+    type: "object",
+    defaultFactory: () => ({}),
+    normalize: normalizeTextScaleByDisplay,
+  },
   shortcuts: {
     type: "object",
     defaultFactory: () => getDefaultShortcuts(),
@@ -196,28 +231,40 @@ const SCHEMA = {
       // subagentPermissionsEnabled (#451): bubbles for PermissionRequests
       // fired inside a Task subagent. Only claude-code carries the flag —
       // normalizeAgents drops it for agents whose default entry lacks it.
-      "claude-code": { enabled: true, permissionsEnabled: true, subagentPermissionsEnabled: true, notificationHookEnabled: true },
-      "codex": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true, permissionMode: "intercept", nativeNotificationSoundEnabled: false },
-      "copilot-cli": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
-      "cursor-agent": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
-      "gemini-cli": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
+      "claude-code": { integrationInstalled: true, enabled: true, permissionsEnabled: true, subagentPermissionsEnabled: true, notificationHookEnabled: true },
+      "codex": { integrationInstalled: true, enabled: true, permissionsEnabled: true, notificationHookEnabled: true, permissionMode: "intercept", nativeNotificationSoundEnabled: false },
+      "copilot-cli": { integrationInstalled: false, enabled: false, permissionsEnabled: true, notificationHookEnabled: true },
+      "cursor-agent": { integrationInstalled: false, enabled: false, permissionsEnabled: true, notificationHookEnabled: true },
+      "gemini-cli": { integrationInstalled: false, enabled: false, permissionsEnabled: true, notificationHookEnabled: true },
       // Antigravity is state-only post-D2 — Clawd never surfaces a permission
       // bubble for agy regardless of this flag (see server-route-permission.js
       // antigravity branch). Default kept as false so legacy reads don't see a
       // stale "true" implying bubbles are enabled.
-      "antigravity-cli": { enabled: true, permissionsEnabled: false },
-      "codebuddy": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
-      "kiro-cli": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
-      "kimi-cli": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
-      "qwen-code": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
-      "opencode": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
-      "pi": { enabled: true, permissionsEnabled: false, notificationHookEnabled: true },
-      "openclaw": { enabled: true, permissionsEnabled: false, notificationHookEnabled: true },
-      "hermes": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
+      "antigravity-cli": { integrationInstalled: false, enabled: false, permissionsEnabled: false },
+      "codebuddy": { integrationInstalled: false, enabled: false, permissionsEnabled: true, notificationHookEnabled: true },
+      "kiro-cli": { integrationInstalled: false, enabled: false, permissionsEnabled: true, notificationHookEnabled: true },
+      "kimi-cli": { integrationInstalled: false, enabled: false, permissionsEnabled: true, notificationHookEnabled: true },
+      "qwen-code": { integrationInstalled: false, enabled: false, permissionsEnabled: true, notificationHookEnabled: true },
+      "codewhale": { integrationInstalled: false, enabled: false, permissionsEnabled: false, notificationHookEnabled: true },
+      "opencode": { integrationInstalled: false, enabled: false, permissionsEnabled: true, notificationHookEnabled: true },
+      "pi": { integrationInstalled: false, enabled: false, permissionsEnabled: false, notificationHookEnabled: true },
+      "openclaw": { integrationInstalled: false, enabled: false, permissionsEnabled: false, notificationHookEnabled: true },
+      "hermes": { integrationInstalled: false, enabled: false, permissionsEnabled: true, notificationHookEnabled: true },
       // Qoder is state-only (Phase 1) — permission bubbles default off.
-      "qoder": { enabled: true, permissionsEnabled: false, notificationHookEnabled: true },
+      "qoder": { integrationInstalled: false, enabled: false, permissionsEnabled: false, notificationHookEnabled: true },
+      "reasonix": { integrationInstalled: false, enabled: false, permissionsEnabled: false, notificationHookEnabled: true },
     }),
     normalize: normalizeAgents,
+  },
+  dismissedAgentInstallHints: {
+    type: "object",
+    defaultFactory: () => ({}),
+    normalize: normalizeDismissedAgentHintMap,
+  },
+  dismissedAgentCleanupHints: {
+    type: "object",
+    defaultFactory: () => ({}),
+    normalize: normalizeDismissedAgentHintMap,
   },
   themeOverrides: {
     type: "object",
@@ -300,6 +347,15 @@ const SCHEMA = {
     defaultFactory: () => ({}),
     normalize: normalizeDismissedUpdateVersions,
   },
+  // First-run tutorial gate: false until the user has seen (completed OR skipped)
+  // the onboarding tutorial once, then true forever. Persisted (NOT ephemeral),
+  // and intentionally NOT backfilled by any migration. Existing users' files have
+  // no tutorialSeen key, so validate() resolves it to the false default — meaning
+  // they ALSO get the tutorial once on their next launch after updating, exactly
+  // like a brand-new install. "Seen once → true → never shown again", across any
+  // future version update. (Contrast showDock, which is migration-backfilled so
+  // ONLY fresh installs pick up its new default.)
+  tutorialSeen: { type: "boolean", default: false },
 };
 
 const SCHEMA_KEYS = Object.freeze(Object.keys(SCHEMA));
@@ -389,6 +445,9 @@ function normalizeStaleTriple(out) {
 //   is reset off.
 function migrate(raw) {
   if (!raw || typeof raw !== "object") return raw;
+  const originalAgentIds = raw.agents && typeof raw.agents === "object" && !Array.isArray(raw.agents)
+    ? new Set(Object.keys(raw.agents))
+    : new Set();
   const out = { ...raw };
   if (out.version === undefined || out.version === null) {
     out.version = 1;
@@ -503,6 +562,48 @@ function migrate(raw) {
     out.autoApproveAllPermissions = false;
     out.version = 9;
   }
+  // v9 -> v10: sessionHudShowElapsed / sessionHudCleanupDetached flipped their
+  // schema defaults for FRESH INSTALLS ONLY (compact HUD by default). Existing
+  // files normally carry both keys explicitly (save() bakes the full
+  // snapshot), but a file written by a pre-HUD-toggle build or hand-trimmed
+  // by the user lacks them — without this backfill validate() would hand
+  // those users the new defaults and visibly change their HUD. Pin the old
+  // defaults for every pre-v10 file; fresh installs never run migrate().
+  if (out.version < 10) {
+    if (!("sessionHudShowElapsed" in out)) out.sessionHudShowElapsed = true;
+    if (!("sessionHudCleanupDetached" in out)) out.sessionHudCleanupDetached = false;
+    out.version = 10;
+  }
+  // v10 -> v11: agent integrations are installed on demand. Entries that were
+  // actually present in an old prefs file predate `integrationInstalled`, so
+  // keep them managed by Clawd. Missing entries fall through to v11 defaults
+  // instead of pretending that a never-seen/newer agent was installed.
+  if (out.version < 11) {
+    if (out.agents && typeof out.agents === "object") {
+      const defaults = SCHEMA.agents.defaultFactory();
+      for (const agentId of Object.keys(defaults)) {
+        if (!originalAgentIds.has(agentId)) continue;
+        const current = out.agents[agentId];
+        if (!current || typeof current !== "object") continue;
+        out.agents[agentId] = {
+          ...current,
+          integrationInstalled: true,
+        };
+      }
+    }
+    out.version = 11;
+  }
+  // v11 -> v12: showDock now defaults OFF for FRESH INSTALLS ONLY (a new install
+  // runs as a menu-bar/pet accessory with no Dock tile). Existing files normally
+  // carry showDock explicitly (save() bakes the full snapshot), but a file from a
+  // pre-showDock build or hand-trimmed by the user lacks it — without this
+  // backfill validate() would hand those users the new off default and hide their
+  // Dock. Pin the old on-default for every pre-v12 file; fresh installs never run
+  // migrate().
+  if (out.version < 12) {
+    if (!("showDock" in out)) out.showDock = true;
+    out.version = 12;
+  }
   if ((typeof out.version === "number" ? out.version : 0) < CURRENT_VERSION) {
     out.version = CURRENT_VERSION;
   }
@@ -510,10 +611,26 @@ function migrate(raw) {
   return out;
 }
 
-const AGENT_FLAGS = ["enabled", "permissionsEnabled", "subagentPermissionsEnabled", "notificationHookEnabled", "nativeNotificationSoundEnabled"];
+const AGENT_FLAGS = [
+  "integrationInstalled",
+  "enabled",
+  "permissionsEnabled",
+  "subagentPermissionsEnabled",
+  "notificationHookEnabled",
+  "nativeNotificationSoundEnabled",
+];
 const CODEX_PERMISSION_MODES = ["native", "intercept"];
 
 function normalizeDismissedUpdateVersions(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const out = {};
+  for (const key of Object.keys(value)) {
+    if (typeof key === "string" && key && value[key] === true) out[key] = true;
+  }
+  return out;
+}
+
+function normalizeDismissedAgentHintMap(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const out = {};
   for (const key of Object.keys(value)) {
@@ -548,7 +665,12 @@ function normalizeAgents(value, defaultsValue) {
     const entry = value[id];
     if (!entry || typeof entry !== "object") continue;
     const base = (defaultsValue && defaultsValue[id])
-      || { enabled: true, permissionsEnabled: true, notificationHookEnabled: true };
+      || {
+        integrationInstalled: isDefaultIntegrationInstalled(id),
+        enabled: true,
+        permissionsEnabled: true,
+        notificationHookEnabled: true,
+      };
     const merged = { ...base };
     let touched = false;
     const allowedFlags = AGENT_FLAGS.filter((flag) => Object.prototype.hasOwnProperty.call(base, flag));
@@ -769,19 +891,25 @@ function normalizeThemeVariant(value, defaultsValue) {
 
 // ── Disk I/O ──
 
-// Read prefs from disk. Returns `{ snapshot, locked }`:
+// Read prefs from disk. Returns `{ snapshot, locked, fresh? }`:
 //   - snapshot: a valid prefs object (always — falls back to defaults on any error)
 //   - locked: true if the file came from a future version; save() should be a no-op
 //             to avoid clobbering it.
+//   - fresh: true ONLY when there was no prefs file at all (brand-new install).
+//            Callers use this to seed first-run-only state (e.g. UI language from
+//            the device locale) without ever overriding an existing user's choices.
+//            Absent/falsy on every other path — a corrupt or unreadable file is
+//            NOT treated as fresh, so we never clobber a returning user's language.
 function load(prefsPath) {
   let raw;
   try {
     const text = fs.readFileSync(prefsPath, "utf8");
     raw = JSON.parse(text);
   } catch (err) {
-    // Missing file is normal on first run — return defaults silently.
+    // Missing file is normal on first run — return defaults silently, flagged
+    // fresh so the caller can seed device-locale language exactly once.
     if (err && err.code === "ENOENT") {
-      return { snapshot: getDefaults(), locked: false };
+      return { snapshot: getDefaults(), locked: false, fresh: true };
     }
     // Any other error (parse fail, permission, etc.) → backup + defaults
     try {
@@ -825,17 +953,37 @@ function save(prefsPath, snapshot) {
   fs.writeFileSync(prefsPath, JSON.stringify(validated, null, 2));
 }
 
+// Map an OS locale string (e.g. Electron's app.getLocale()) onto one of the
+// supported UI languages. Used ONLY to seed `lang` on a brand-new install from
+// the device locale — existing users keep whatever they picked. Unknown or empty
+// locales fall back to English. Pure (no Electron dependency) so it stays
+// unit-testable; the caller passes app.getLocale() in.
+function mapLocaleToLang(locale) {
+  if (typeof locale !== "string" || !locale) return "en";
+  const l = locale.toLowerCase().replace(/_/g, "-");
+  if (l === "zh" || l.startsWith("zh-")) {
+    // Traditional-script tags/regions → zh-TW; all other Chinese → zh.
+    if (/hant/.test(l) || /^zh-(tw|hk|mo)\b/.test(l)) return "zh-TW";
+    return "zh";
+  }
+  if (l === "ko" || l.startsWith("ko-")) return "ko";
+  if (l === "ja" || l.startsWith("ja-")) return "ja";
+  return "en";
+}
+
 module.exports = {
   CURRENT_VERSION,
   SCHEMA,
   SCHEMA_KEYS,
   AGENT_FLAGS,
   CODEX_PERMISSION_MODES,
+  DEFAULT_INTEGRATION_INSTALLED_IDS,
   getDefaults,
   validate,
   migrate,
   load,
   save,
+  mapLocaleToLang,
   normalizeThemeOverrides,
   normalizeShortcuts,
 };
