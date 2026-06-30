@@ -91,6 +91,8 @@ function update(api, o = {}) {
       ghosttyTerminalId: o.ghosttyTerminalId ?? null,
       assistantLastOutput: o.assistantLastOutput ?? null,
       assistantLastOutputTruncated: o.assistantLastOutputTruncated ?? false,
+      toolName: o.toolName ?? null,
+      transcriptPath: o.transcriptPath ?? null,
       backgroundTasksCount: o.backgroundTasksCount ?? 0,
       sessionCronsCount: o.sessionCronsCount ?? 0,
       stopHookActive: o.stopHookActive ?? false,
@@ -1527,6 +1529,7 @@ describe("updateSession()", () => {
     assert.deepStrictEqual(stateChanges, ["attention"]);
     assert.strictEqual(api.sessions.get("codex:remote").requiresCompletionAck, true);
     mock.timers.tick(4000);
+    const firstEvents = api.sessions.get("codex:remote").recentEvents.map((entry) => ({ ...entry }));
     assert.strictEqual(api.getCurrentState(), "idle");
 
     soundsPlayed.length = 0;
@@ -1543,6 +1546,7 @@ describe("updateSession()", () => {
     assert.ok(!stateChanges.includes("attention"), "duplicate task_complete must not re-send attention");
     assert.strictEqual(api.deriveSessionBadge(api.sessions.get("codex:remote")), "done");
     assert.strictEqual(api.sessions.get("codex:remote").requiresCompletionAck, true);
+    assert.deepStrictEqual(api.sessions.get("codex:remote").recentEvents, firstEvents);
   });
 
   it("shows one local Codex completion bubble and suppresses duplicate completion events", () => {
@@ -1609,6 +1613,57 @@ describe("updateSession()", () => {
     assert.deepStrictEqual(bubbles, []);
   });
 
+  it("keeps official Codex Stop as the completion tail when JSONL task_complete arrives later", () => {
+    const soundsPlayed = [];
+    const stateChanges = [];
+    api.cleanup();
+    ctx = makeCtx({
+      processKill: () => true,
+      playSound: (name) => soundsPlayed.push(name),
+      sendToRenderer: (channel, state) => {
+        if (channel === "state-change") stateChanges.push(state);
+      },
+    });
+    api = require("../src/state")(ctx);
+
+    api.updateSession("codex:s2", "working", "PreToolUse", {
+      agentId: "codex",
+      cwd: "/tmp",
+      hookSource: "codex-official",
+    });
+    mock.timers.tick(1000);
+    stateChanges.length = 0;
+
+    api.updateSession("codex:s2", "attention", "Stop", {
+      agentId: "codex",
+      cwd: "/tmp",
+      hookSource: "codex-official",
+    });
+    assert.strictEqual(soundsPlayed.filter((name) => name === "complete").length, 1);
+
+    const firstEvents = api.sessions.get("codex:s2").recentEvents.map((entry) => ({ ...entry }));
+    assert.strictEqual(firstEvents.at(-1).event, "Stop");
+
+    mock.timers.tick(4000);
+    assert.strictEqual(api.getCurrentState(), "idle");
+
+    soundsPlayed.length = 0;
+    stateChanges.length = 0;
+
+    api.updateSession("codex:s2", "attention", "event_msg:task_complete", {
+      agentId: "codex",
+      cwd: "/tmp",
+    });
+
+    assert.strictEqual(soundsPlayed.filter((name) => name === "complete").length, 0);
+    assert.ok(!stateChanges.includes("attention"), "late task_complete must not re-send attention");
+
+    const session = api.sessions.get("codex:s2");
+    assert.deepStrictEqual(session.recentEvents, firstEvents);
+    assert.strictEqual(session.recentEvents.at(-1).event, "Stop");
+    assert.strictEqual(api.deriveSessionBadge(session), "done");
+    assert.strictEqual(api.getCurrentState(), "idle");
+  });
   it("still plays completion after new progress follows a completed turn", () => {
     const soundsPlayed = [];
     const stateChanges = [];
@@ -2662,6 +2717,88 @@ describe("Stop completion gate (#406)", () => {
       if (saved === undefined) delete process.env.CLAWD_COMPLETION_DEBOUNCE_MS;
       else process.env.CLAWD_COMPLETION_DEBOUNCE_MS = saved;
     }
+  });
+
+  it("Claude AskUserQuestion PostToolUse falls back to transcript completion when Stop is missed", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-claude-stop-fallback-"));
+    const transcript = path.join(dir, "transcript.jsonl");
+    fs.writeFileSync(transcript, [
+      JSON.stringify({ type: "assistant", sessionId: "s1", message: { content: [{ type: "tool_use", name: "AskUserQuestion" }] } }),
+      JSON.stringify({ type: "user", sessionId: "s1", message: { content: [{ type: "tool_result", content: "Allow" }] } }),
+    ].join("\n") + "\n");
+
+    update(api, {
+      id: "s1",
+      state: "working",
+      event: "PostToolUse",
+      toolName: "AskUserQuestion",
+      transcriptPath: transcript,
+    });
+
+    mock.timers.tick(1999);
+    assert.strictEqual(api.sessions.get("s1").state, "working");
+    assert.deepStrictEqual(soundsPlayed, []);
+
+    fs.appendFileSync(transcript, JSON.stringify({
+      type: "assistant",
+      sessionId: "s1",
+      message: { content: "Final answer from Claude Desktop." },
+    }) + "\n");
+    mock.timers.tick(1);
+
+    const session = api.sessions.get("s1");
+    assert.strictEqual(session.state, "idle");
+    assert.strictEqual(session.assistantLastOutput, "Final answer from Claude Desktop.");
+    assert.strictEqual(api.getCurrentState(), "attention");
+    assert.ok(soundsPlayed.includes("complete"));
+    assert.strictEqual(api.deriveSessionBadge(session), "done");
+  });
+
+  it("Claude transcript completion fallback is limited to AskUserQuestion tool results", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-claude-stop-fallback-"));
+    const transcript = path.join(dir, "transcript.jsonl");
+    fs.writeFileSync(transcript, [
+      JSON.stringify({ type: "user", sessionId: "s1", message: { content: [{ type: "tool_result", content: "ok" }] } }),
+      JSON.stringify({ type: "assistant", sessionId: "s1", message: { content: "Intermediate explanation." } }),
+    ].join("\n") + "\n");
+
+    update(api, {
+      id: "s1",
+      state: "working",
+      event: "PostToolUse",
+      toolName: "Read",
+      transcriptPath: transcript,
+    });
+    mock.timers.tick(10000);
+
+    assert.strictEqual(api.sessions.get("s1").state, "working");
+    assert.ok(!soundsPlayed.includes("complete"));
+    assert.strictEqual(api.deriveSessionBadge(api.sessions.get("s1")), "running");
+  });
+
+  it("Claude transcript completion fallback cancels when work resumes", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clawd-claude-stop-fallback-"));
+    const transcript = path.join(dir, "transcript.jsonl");
+    fs.writeFileSync(transcript, [
+      JSON.stringify({ type: "assistant", sessionId: "s1", message: { content: [{ type: "tool_use", name: "AskUserQuestion" }] } }),
+      JSON.stringify({ type: "user", sessionId: "s1", message: { content: [{ type: "tool_result", content: "Allow" }] } }),
+      JSON.stringify({ type: "assistant", sessionId: "s1", message: { content: "Continuing after answer." } }),
+    ].join("\n") + "\n");
+
+    update(api, {
+      id: "s1",
+      state: "working",
+      event: "PostToolUse",
+      toolName: "AskUserQuestion",
+      transcriptPath: transcript,
+    });
+    mock.timers.tick(500);
+    update(api, { id: "s1", state: "working", event: "PreToolUse" });
+    mock.timers.tick(10000);
+
+    assert.strictEqual(api.sessions.get("s1").state, "working");
+    assert.ok(!soundsPlayed.includes("complete"));
+    assert.strictEqual(api.deriveSessionBadge(api.sessions.get("s1")), "running");
   });
 });
 
